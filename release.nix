@@ -1,12 +1,9 @@
 { nix ? { outPath = ./.; revCount = 1234; shortRev = "abcdef"; }
-, nixpkgs ? { outPath = <nixpkgs>; revCount = 1234; shortRev = "abcdef"; }
+, pkgs ? import <nixpkgs> {}
 , officialRelease ? false
 }:
 
 let
-
-  pkgs = import <nixpkgs> {};
-
   systems = [ "x86_64-linux" "i686-linux" "x86_64-darwin" /* "x86_64-freebsd" "i686-freebsd" */ ];
 
 
@@ -65,7 +62,7 @@ let
 
     build = pkgs.lib.genAttrs systems (system:
 
-      with import <nixpkgs> { inherit system; };
+      with pkgs;
 
       releaseTools.nixBuild {
         name = "nix";
@@ -105,7 +102,7 @@ let
     binaryTarball = pkgs.lib.genAttrs systems (system:
 
       # FIXME: temporarily use a different branch for the Darwin build.
-      with import <nixpkgs> { inherit system; };
+      with pkgs;
 
       let
         toplevel = builtins.getAttr system jobs.build;
@@ -140,7 +137,7 @@ let
 
 
     coverage =
-      with import <nixpkgs> { system = "x86_64-linux"; };
+      with pkgs;
 
       releaseTools.coverageAnalysis {
         name = "nix-build";
@@ -207,7 +204,7 @@ let
     });
 
     tests.binaryTarball =
-      with import <nixpkgs> { system = "x86_64-linux"; };
+      with pkgs;
       vmTools.runInLinuxImage (runCommand "nix-binary-tarball-test"
         { diskImage = vmTools.diskImages.ubuntu1204x86_64;
         }
@@ -226,8 +223,8 @@ let
         ''); # */
 
     tests.evalNixpkgs =
-      import <nixpkgs/pkgs/top-level/make-tarball.nix> {
-        inherit nixpkgs;
+      import pkgs.path + "/pkgs/top-level/make-tarball.nix" {
+        nixpkgs = pkgs.path;
         inherit pkgs;
         nix = build.x86_64-linux;
         officialRelease = false;
@@ -240,7 +237,7 @@ let
           export NIX_STATE_DIR=$TMPDIR
           nix-store --init
 
-          nix-instantiate ${nixpkgs}/nixos/release-combined.nix -A tested --dry-run
+          nix-instantiate ${pkgs.path}/nixos/release-combined.nix -A tested --dry-run
 
           touch $out
         '';
@@ -289,7 +286,7 @@ let
   makeRPM =
     system: diskImageFun: extraPackages:
 
-    with import <nixpkgs> { inherit system; };
+    with pkgs;
 
     releaseTools.rpmBuild rec {
       name = "nix-rpm";
@@ -310,7 +307,7 @@ let
   makeDeb =
     system: diskImageFun: extraPackages: extraDebPackages:
 
-    with import <nixpkgs> { inherit system; };
+    with pkgs;
 
     releaseTools.debBuild {
       name = "nix-deb";
