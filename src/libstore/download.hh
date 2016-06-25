@@ -9,7 +9,7 @@ namespace nix {
 struct DownloadOptions
 {
     string expectedETag;
-    bool verifyTLS{true};
+    bool verifyTLS{false};
     enum { yes, no, automatic } showProgress{yes};
     bool head{false};
 };
