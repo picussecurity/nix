@@ -2,6 +2,7 @@
 #include "globals.hh"
 #include "local-store.hh"
 #include "store-api.hh"
+#include "thread-pool.hh"
 
 
 namespace nix {
@@ -10,157 +11,196 @@ namespace nix {
 void Store::computeFSClosure(const Path & path,
     PathSet & paths, bool flipDirection, bool includeOutputs, bool includeDerivers)
 {
-    if (paths.find(path) != paths.end()) return;
-    paths.insert(path);
+    ThreadPool pool;
 
-    PathSet edges;
+    Sync<bool> state_;
 
-    if (flipDirection) {
-        queryReferrers(path, edges);
+    std::function<void(Path)> doPath;
 
-        if (includeOutputs) {
-            PathSet derivers = queryValidDerivers(path);
-            for (auto & i : derivers)
-                edges.insert(i);
+    doPath = [&](const Path & path) {
+        {
+            auto state(state_.lock());
+            if (paths.count(path)) return;
+            paths.insert(path);
         }
 
-        if (includeDerivers && isDerivation(path)) {
-            PathSet outputs = queryDerivationOutputs(path);
-            for (auto & i : outputs)
-                if (isValidPath(i) && queryPathInfo(i)->deriver == path)
-                    edges.insert(i);
-        }
-
-    } else {
         auto info = queryPathInfo(path);
-        edges = info->references;
 
-        if (includeOutputs && isDerivation(path)) {
-            PathSet outputs = queryDerivationOutputs(path);
-            for (auto & i : outputs)
-                if (isValidPath(i)) edges.insert(i);
+        if (flipDirection) {
+
+            PathSet referrers;
+            queryReferrers(path, referrers);
+            for (auto & ref : referrers)
+                if (ref != path)
+                    pool.enqueue(std::bind(doPath, ref));
+
+            if (includeOutputs) {
+                PathSet derivers = queryValidDerivers(path);
+                for (auto & i : derivers)
+                    pool.enqueue(std::bind(doPath, i));
+            }
+
+            if (includeDerivers && isDerivation(path)) {
+                PathSet outputs = queryDerivationOutputs(path);
+                for (auto & i : outputs)
+                    if (isValidPath(i) && queryPathInfo(i)->deriver == path)
+                        pool.enqueue(std::bind(doPath, i));
+            }
+
+        } else {
+
+            for (auto & ref : info->references)
+                if (ref != path)
+                    pool.enqueue(std::bind(doPath, ref));
+
+            if (includeOutputs && isDerivation(path)) {
+                PathSet outputs = queryDerivationOutputs(path);
+                for (auto & i : outputs)
+                    if (isValidPath(i)) pool.enqueue(std::bind(doPath, i));
+            }
+
+            if (includeDerivers && isValidPath(info->deriver))
+                pool.enqueue(std::bind(doPath, info->deriver));
+
         }
+    };
 
-        if (includeDerivers && isValidPath(info->deriver))
-            edges.insert(info->deriver);
-    }
+    pool.enqueue(std::bind(doPath, path));
 
-    for (auto & i : edges)
-        computeFSClosure(i, paths, flipDirection, includeOutputs, includeDerivers);
+    pool.process();
 }
 
 
 void Store::queryMissing(const PathSet & targets,
-    PathSet & willBuild, PathSet & willSubstitute, PathSet & unknown,
-    unsigned long long & downloadSize, unsigned long long & narSize)
+    PathSet & willBuild_, PathSet & willSubstitute_, PathSet & unknown_,
+    unsigned long long & downloadSize_, unsigned long long & narSize_)
 {
-    downloadSize = narSize = 0;
+    downloadSize_ = narSize_ = 0;
 
-    PathSet todo(targets.begin(), targets.end()), done;
+    ThreadPool pool;
 
-    /* Getting substitute info has high latency when using the binary
-       cache substituter.  Thus it's essential to do substitute
-       queries in parallel as much as possible.  To accomplish this
-       we do the following:
+    struct State
+    {
+        PathSet done;
+        PathSet & unknown, & willSubstitute, & willBuild;
+        unsigned long long & downloadSize;
+        unsigned long long & narSize;
+    };
 
-       - For all paths still to be processed (‘todo’), we add all
-         paths for which we need info to the set ‘query’.  For an
-         unbuilt derivation this is the output paths; otherwise, it's
-         the path itself.
+    struct DrvState
+    {
+        size_t left;
+        bool done = false;
+        PathSet outPaths;
+        DrvState(size_t left) : left(left) { }
+    };
 
-       - We get info about all paths in ‘query’ in parallel.
+    Sync<State> state_(State{PathSet(), unknown_, willSubstitute_, willBuild_, downloadSize_, narSize_});
 
-       - We process the results and add new items to ‘todo’ if
-         necessary.  E.g. if a path is substitutable, then we need to
-         get info on its references.
+    std::function<void(Path)> doPath;
 
-       - Repeat until ‘todo’ is empty.
-    */
-
-    while (!todo.empty()) {
-
-        PathSet query, todoDrv, todoNonDrv;
-
-        for (auto & i : todo) {
-            if (done.find(i) != done.end()) continue;
-            done.insert(i);
-
-            DrvPathWithOutputs i2 = parseDrvPathWithOutputs(i);
-
-            if (isDerivation(i2.first)) {
-                if (!isValidPath(i2.first)) {
-                    // FIXME: we could try to substitute p.
-                    unknown.insert(i);
-                    continue;
-                }
-                Derivation drv = derivationFromPath(i2.first);
-
-                PathSet invalid;
-                for (auto & j : drv.outputs)
-                    if (wantOutput(j.first, i2.second)
-                        && !isValidPath(j.second.path))
-                        invalid.insert(j.second.path);
-                if (invalid.empty()) continue;
-
-                todoDrv.insert(i);
-                if (settings.useSubstitutes && drv.substitutesAllowed())
-                    query.insert(invalid.begin(), invalid.end());
-            }
-
-            else {
-                if (isValidPath(i)) continue;
-                query.insert(i);
-                todoNonDrv.insert(i);
-            }
+    auto mustBuildDrv = [&](const Path & drvPath, const Derivation & drv) {
+        {
+            auto state(state_.lock());
+            state->willBuild.insert(drvPath);
         }
 
-        todo.clear();
+        for (auto & i : drv.inputDrvs)
+            pool.enqueue(std::bind(doPath, makeDrvPathWithOutputs(i.first, i.second)));
+    };
+
+    auto checkOutput = [&](
+        const Path & drvPath, ref<Derivation> drv, const Path & outPath, ref<Sync<DrvState>> drvState_)
+    {
+        if (drvState_->lock()->done) return;
 
         SubstitutablePathInfos infos;
-        querySubstitutablePathInfos(query, infos);
+        querySubstitutablePathInfos({outPath}, infos);
 
-        for (auto & i : todoDrv) {
-            DrvPathWithOutputs i2 = parseDrvPathWithOutputs(i);
+        if (infos.empty()) {
+            drvState_->lock()->done = true;
+            mustBuildDrv(drvPath, *drv);
+        } else {
+            {
+                auto drvState(drvState_->lock());
+                if (drvState->done) return;
+                assert(drvState->left);
+                drvState->left--;
+                drvState->outPaths.insert(outPath);
+                if (!drvState->left) {
+                    for (auto & path : drvState->outPaths)
+                        pool.enqueue(std::bind(doPath, path));
+                }
+            }
+        }
+    };
 
-            // FIXME: cache this
+    doPath = [&](const Path & path) {
+
+        {
+            auto state(state_.lock());
+            if (state->done.count(path)) return;
+            state->done.insert(path);
+        }
+
+        DrvPathWithOutputs i2 = parseDrvPathWithOutputs(path);
+
+        if (isDerivation(i2.first)) {
+            if (!isValidPath(i2.first)) {
+                // FIXME: we could try to substitute the derivation.
+                auto state(state_.lock());
+                state->unknown.insert(path);
+                return;
+            }
+
             Derivation drv = derivationFromPath(i2.first);
 
-            PathSet outputs;
-            bool mustBuild = false;
+            PathSet invalid;
+            for (auto & j : drv.outputs)
+                if (wantOutput(j.first, i2.second)
+                    && !isValidPath(j.second.path))
+                    invalid.insert(j.second.path);
+            if (invalid.empty()) return;
+
             if (settings.useSubstitutes && drv.substitutesAllowed()) {
-                for (auto & j : drv.outputs) {
-                    if (!wantOutput(j.first, i2.second)) continue;
-                    if (!isValidPath(j.second.path)) {
-                        if (infos.find(j.second.path) == infos.end())
-                            mustBuild = true;
-                        else
-                            outputs.insert(j.second.path);
-                    }
-                }
+                auto drvState = make_ref<Sync<DrvState>>(DrvState(invalid.size()));
+                for (auto & output : invalid)
+                    pool.enqueue(std::bind(checkOutput, i2.first, make_ref<Derivation>(drv), output, drvState));
             } else
-                mustBuild = true;
+                mustBuildDrv(i2.first, drv);
 
-            if (mustBuild) {
-                willBuild.insert(i2.first);
-                todo.insert(drv.inputSrcs.begin(), drv.inputSrcs.end());
-                for (auto & j : drv.inputDrvs)
-                    todo.insert(makeDrvPathWithOutputs(j.first, j.second));
-            } else
-                todoNonDrv.insert(outputs.begin(), outputs.end());
-        }
+        } else {
 
-        for (auto & i : todoNonDrv) {
-            done.insert(i);
-            SubstitutablePathInfos::iterator info = infos.find(i);
-            if (info != infos.end()) {
-                willSubstitute.insert(i);
-                downloadSize += info->second.downloadSize;
-                narSize += info->second.narSize;
-                todo.insert(info->second.references.begin(), info->second.references.end());
-            } else
-                unknown.insert(i);
+            if (isValidPath(path)) return;
+
+            SubstitutablePathInfos infos;
+            querySubstitutablePathInfos({path}, infos);
+
+            if (infos.empty()) {
+                auto state(state_.lock());
+                state->unknown.insert(path);
+                return;
+            }
+
+            auto info = infos.find(path);
+            assert(info != infos.end());
+
+            {
+                auto state(state_.lock());
+                state->willSubstitute.insert(path);
+                state->downloadSize += info->second.downloadSize;
+                state->narSize += info->second.narSize;
+            }
+
+            for (auto & ref : info->second.references)
+                pool.enqueue(std::bind(doPath, ref));
         }
-    }
+    };
+
+    for (auto & path : targets)
+        pool.enqueue(std::bind(doPath, path));
+
+    pool.process();
 }
 
 

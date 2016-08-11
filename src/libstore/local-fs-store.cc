@@ -7,7 +7,9 @@ namespace nix {
 
 LocalFSStore::LocalFSStore(const Params & params)
     : Store(params)
-    , stateDir(get(params, "state", settings.nixStateDir))
+    , rootDir(get(params, "root"))
+    , stateDir(canonPath(get(params, "state", rootDir != "" ? rootDir + "/nix/var/nix" : settings.nixStateDir)))
+    , logDir(canonPath(get(params, "log", rootDir != "" ? rootDir + "/nix/var/log/nix" : settings.nixLogDir)))
 {
 }
 
@@ -21,7 +23,7 @@ struct LocalStoreAccessor : public FSAccessor
     {
         Path storePath = store->toStorePath(path);
         if (!store->isValidPath(storePath))
-            throw Error(format("path ‘%1%’ is not a valid store path") % storePath);
+            throw InvalidPath(format("path ‘%1%’ is not a valid store path") % storePath);
         return store->getRealStoreDir() + std::string(path, store->storeDir.size());
     }
 
@@ -79,7 +81,7 @@ void LocalFSStore::narFromPath(const Path & path, Sink & sink)
 {
     if (!isValidPath(path))
         throw Error(format("path ‘%s’ is not valid") % path);
-    dumpPath(path, sink);
+    dumpPath(getRealStoreDir() + std::string(path, storeDir.size()), sink);
 }
 
 }

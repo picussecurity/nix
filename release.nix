@@ -233,7 +233,6 @@ let
     tests.evalNixOS =
       pkgs.runCommand "eval-nixos" { buildInputs = [ build.x86_64-linux ]; }
         ''
-          export NIX_DB_DIR=$TMPDIR
           export NIX_STATE_DIR=$TMPDIR
           nix-store --init
 

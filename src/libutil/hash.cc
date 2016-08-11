@@ -121,6 +121,7 @@ const string base32Chars = "0123456789abcdfghijklmnpqrsvwxyz";
 
 string printHash32(const Hash & hash)
 {
+    assert(hash.hashSize);
     size_t len = hash.base32Len();
     assert(len);
 
@@ -255,11 +256,11 @@ Hash hashFile(HashType ht, const Path & path)
     start(ht, ctx);
 
     AutoCloseFD fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd == -1) throw SysError(format("opening file ‘%1%’") % path);
+    if (!fd) throw SysError(format("opening file ‘%1%’") % path);
 
     unsigned char buf[8192];
     ssize_t n;
-    while ((n = read(fd, buf, sizeof(buf)))) {
+    while ((n = read(fd.get(), buf, sizeof(buf)))) {
         checkInterrupt();
         if (n == -1) throw SysError(format("reading file ‘%1%’") % path);
         update(ht, ctx, buf, n);

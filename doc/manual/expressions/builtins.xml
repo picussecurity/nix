@@ -142,7 +142,7 @@ if builtins ? getEnv then builtins.getEnv "PATH" else ""</programlisting>
     evaluates to the Nix platform identifier for the Nix installation
     on which the expression is being evaluated, such as
     <literal>"i686-linux"</literal> or
-    <literal>"powerpc-darwin"</literal>.</para></listitem>
+    <literal>"x86_64-darwin"</literal>.</para></listitem>
 
   </varlistentry>
 
@@ -853,7 +853,14 @@ builtins.sort builtins.lessThan [ 483 249 526 147 42 77 ]
     len</replaceable> lies beyond the end of the string, only the
     substring up to the end of the string is returned.
     <replaceable>start</replaceable> must be
-    non-negative.</para></listitem>
+    non-negative. For example,
+
+<programlisting>
+builtins.substring 0 3 "nixos"
+</programlisting>
+
+   evaluates to <literal>"nix"</literal>.
+   </para></listitem>
 
   </varlistentry>
 

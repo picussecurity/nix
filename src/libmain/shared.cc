@@ -252,7 +252,6 @@ void printVersion(const string & programName)
         std::cout << "Configuration file: " << settings.nixConfDir + "/nix.conf" << "\n";
         std::cout << "Store directory: " << settings.nixStore << "\n";
         std::cout << "State directory: " << settings.nixStateDir << "\n";
-        std::cout << "Database directory: " << settings.nixDBPath << "\n";
     }
     throw Exit();
 }
@@ -325,7 +324,7 @@ RunPager::RunPager()
     toPager.create();
 
     pid = startProcess([&]() {
-        if (dup2(toPager.readSide, STDIN_FILENO) == -1)
+        if (dup2(toPager.readSide.get(), STDIN_FILENO) == -1)
             throw SysError("dupping stdin");
         if (!getenv("LESS"))
             setenv("LESS", "FRSXMK", 1);
@@ -337,7 +336,7 @@ RunPager::RunPager()
         throw SysError(format("executing ‘%1%’") % pager);
     });
 
-    if (dup2(toPager.writeSide, STDOUT_FILENO) == -1)
+    if (dup2(toPager.writeSide.get(), STDOUT_FILENO) == -1)
         throw SysError("dupping stdout");
 }
 

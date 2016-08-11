@@ -5,13 +5,14 @@
 #include <functional>
 #include <queue>
 #include <algorithm>
+#include <regex>
 
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
-
+#include <climits>
 
 namespace nix {
 
@@ -34,19 +35,19 @@ int LocalStore::openGCLock(LockType lockType)
     debug(format("acquiring global GC lock ‘%1%’") % fnGCLock);
 
     AutoCloseFD fdGCLock = open(fnGCLock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-    if (fdGCLock == -1)
+    if (!fdGCLock)
         throw SysError(format("opening global GC lock ‘%1%’") % fnGCLock);
 
-    if (!lockFile(fdGCLock, lockType, false)) {
+    if (!lockFile(fdGCLock.get(), lockType, false)) {
         printMsg(lvlError, format("waiting for the big garbage collector lock..."));
-        lockFile(fdGCLock, lockType, true);
+        lockFile(fdGCLock.get(), lockType, true);
     }
 
     /* !!! Restrict read permission on the GC root.  Otherwise any
        process that can open the file for reading can DoS the
        collector. */
 
-    return fdGCLock.borrow();
+    return fdGCLock.release();
 }
 
 
@@ -149,7 +150,7 @@ void LocalStore::addTempRoot(const Path & path)
     auto state(_state.lock());
 
     /* Create the temporary roots file for this process. */
-    if (state->fdTempRoots == -1) {
+    if (!state->fdTempRoots) {
 
         while (1) {
             Path dir = (format("%1%/%2%") % stateDir % tempRootsDir).str();
@@ -166,15 +167,15 @@ void LocalStore::addTempRoot(const Path & path)
 
             state->fdTempRoots = openLockFile(state->fnTempRoots, true);
 
-            fdGCLock.close();
+            fdGCLock = -1;
 
             debug(format("acquiring read lock on ‘%1%’") % state->fnTempRoots);
-            lockFile(state->fdTempRoots, ltRead, true);
+            lockFile(state->fdTempRoots.get(), ltRead, true);
 
             /* Check whether the garbage collector didn't get in our
                way. */
             struct stat st;
-            if (fstat(state->fdTempRoots, &st) == -1)
+            if (fstat(state->fdTempRoots.get(), &st) == -1)
                 throw SysError(format("statting ‘%1%’") % state->fnTempRoots);
             if (st.st_size == 0) break;
 
@@ -188,14 +189,14 @@ void LocalStore::addTempRoot(const Path & path)
     /* Upgrade the lock to a write lock.  This will cause us to block
        if the garbage collector is holding our lock. */
     debug(format("acquiring write lock on ‘%1%’") % state->fnTempRoots);
-    lockFile(state->fdTempRoots, ltWrite, true);
+    lockFile(state->fdTempRoots.get(), ltWrite, true);
 
     string s = path + '\0';
-    writeFull(state->fdTempRoots, s);
+    writeFull(state->fdTempRoots.get(), s);
 
     /* Downgrade to a read lock. */
     debug(format("downgrading to read lock on ‘%1%’") % state->fnTempRoots);
-    lockFile(state->fdTempRoots, ltRead, true);
+    lockFile(state->fdTempRoots.get(), ltRead, true);
 }
 
 
@@ -211,7 +212,7 @@ void LocalStore::readTempRoots(PathSet & tempRoots, FDs & fds)
 
         debug(format("reading temporary root file ‘%1%’") % path);
         FDPtr fd(new AutoCloseFD(open(path.c_str(), O_CLOEXEC | O_RDWR, 0666)));
-        if (*fd == -1) {
+        if (!*fd) {
             /* It's okay if the file has disappeared. */
             if (errno == ENOENT) continue;
             throw SysError(format("opening temporary roots file ‘%1%’") % path);
@@ -224,10 +225,10 @@ void LocalStore::readTempRoots(PathSet & tempRoots, FDs & fds)
         /* Try to acquire a write lock without blocking.  This can
            only succeed if the owning process has died.  In that case
            we don't care about its temporary roots. */
-        if (lockFile(*fd, ltWrite, false)) {
+        if (lockFile(fd->get(), ltWrite, false)) {
             printMsg(lvlError, format("removing stale temporary roots file ‘%1%’") % path);
             unlink(path.c_str());
-            writeFull(*fd, "d");
+            writeFull(fd->get(), "d");
             continue;
         }
 
@@ -235,10 +236,10 @@ void LocalStore::readTempRoots(PathSet & tempRoots, FDs & fds)
            from upgrading to a write lock, therefore it will block in
            addTempRoot(). */
         debug(format("waiting for read lock on ‘%1%’") % path);
-        lockFile(*fd, ltRead, true);
+        lockFile(fd->get(), ltRead, true);
 
         /* Read the entire file. */
-        string contents = readFile(*fd);
+        string contents = readFile(fd->get());
 
         /* Extract the roots. */
         string::size_type pos = 0, end;
@@ -330,18 +331,117 @@ Roots LocalStore::findRoots()
 }
 
 
+static void readProcLink(const string & file, StringSet & paths)
+{
+    /* 64 is the starting buffer size gnu readlink uses... */
+    auto bufsiz = ssize_t{64};
+try_again:
+    char buf[bufsiz];
+    auto res = readlink(file.c_str(), buf, bufsiz);
+    if (res == -1) {
+        if (errno == ENOENT || errno == EACCES)
+            return;
+        throw SysError("reading symlink");
+    }
+    if (res == bufsiz) {
+        if (SSIZE_MAX / 2 < bufsiz)
+            throw Error("stupidly long symlink");
+        bufsiz *= 2;
+        goto try_again;
+    }
+    if (res > 0 && buf[0] == '/')
+        paths.emplace(static_cast<char *>(buf), res);
+    return;
+}
+
+static string quoteRegexChars(const string & raw)
+{
+    static auto specialRegex = std::regex(R"([.^$\\*+?()\[\]{}|])");
+    return std::regex_replace(raw, specialRegex, R"(\$&)");
+}
+
+static void readFileRoots(const char * path, StringSet & paths)
+{
+    try {
+        paths.emplace(readFile(path));
+    } catch (SysError & e) {
+        if (e.errNo != ENOENT && e.errNo != EACCES)
+            throw;
+    }
+}
+
 void LocalStore::findRuntimeRoots(PathSet & roots)
 {
-    Path rootFinder = getEnv("NIX_ROOT_FINDER",
-        settings.nixLibexecDir + "/nix/find-runtime-roots.pl");
+    StringSet paths;
+    auto procDir = AutoCloseDir{opendir("/proc")};
+    if (procDir) {
+        struct dirent * ent;
+        auto digitsRegex = std::regex(R"(^\d+$)");
+        auto mapRegex = std::regex(R"(^\s*\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(/\S+)\s*$)");
+        auto storePathRegex = std::regex(quoteRegexChars(storeDir) + R"(/[0-9a-z]+[0-9a-zA-Z\+\-\._\?=]*)");
+        while (errno = 0, ent = readdir(procDir)) {
+            checkInterrupt();
+            if (std::regex_match(ent->d_name, digitsRegex)) {
+                readProcLink((format("/proc/%1%/exe") % ent->d_name).str(), paths);
+                readProcLink((format("/proc/%1%/cwd") % ent->d_name).str(), paths);
 
-    if (rootFinder.empty()) return;
+                auto fdStr = (format("/proc/%1%/fd") % ent->d_name).str();
+                auto fdDir = AutoCloseDir(opendir(fdStr.c_str()));
+                if (!fdDir) {
+                    if (errno == ENOENT || errno == EACCES)
+                        continue;
+                    throw SysError(format("opening %1%") % fdStr);
+                }
+                struct dirent * fd_ent;
+                while (errno = 0, fd_ent = readdir(fdDir)) {
+                    if (fd_ent->d_name[0] != '.') {
+                        readProcLink((format("%1%/%2%") % fdStr % fd_ent->d_name).str(), paths);
+                    }
+                }
+                if (errno)
+                    throw SysError(format("iterating /proc/%1%/fd") % ent->d_name);
+                fdDir.close();
 
-    debug(format("executing ‘%1%’ to find additional roots") % rootFinder);
+                auto mapLines =
+                    tokenizeString<std::vector<string>>(readFile((format("/proc/%1%/maps") % ent->d_name).str(), true), "\n");
+                for (const auto& line : mapLines) {
+                    auto match = std::smatch{};
+                    if (std::regex_match(line, match, mapRegex))
+                        paths.emplace(match[1]);
+                }
 
-    string result = runProgram(rootFinder);
+                try {
+                    auto envString = readFile((format("/proc/%1%/environ") % ent->d_name).str(), true);
+                    auto env_end = std::sregex_iterator{};
+                    for (auto i = std::sregex_iterator{envString.begin(), envString.end(), storePathRegex}; i != env_end; ++i)
+                        paths.emplace(i->str());
+                } catch (SysError & e) {
+                    if (errno == ENOENT || errno == EACCES)
+                        continue;
+                    throw;
+                }
+            }
+        }
+        if (errno)
+            throw SysError("iterating /proc");
+    }
 
-    StringSet paths = tokenizeString<StringSet>(result, "\n");
+    try {
+        auto lsofRegex = std::regex(R"(^n(/.*)$)");
+        auto lsofLines =
+            tokenizeString<std::vector<string>>(runProgram("lsof", true, { "-n", "-w", "-F", "n" }), "\n");
+        for (const auto & line : lsofLines) {
+            auto match = std::smatch{};
+            if (std::regex_match(line, match, lsofRegex))
+                paths.emplace(match[1]);
+        }
+    } catch (ExecError & e) {
+        /* lsof not installed, lsof failed */
+    }
+
+    readFileRoots("/proc/sys/kernel/modprobe", paths);
+    readFileRoots("/proc/sys/kernel/fbsplash", paths);
+    readFileRoots("/proc/sys/kernel/poweroff_cmd", paths);
 
     for (auto & i : paths)
         if (isInStore(i)) {
@@ -721,7 +821,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
     }
 
     /* Allow other processes to add to the store from here on. */
-    fdGCLock.close();
+    fdGCLock = -1;
     fds.clear();
 
     /* Delete the trash directory. */

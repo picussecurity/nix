@@ -213,8 +213,7 @@ static void opPrintFixedPath(Strings opFlags, Strings opArgs)
     string name = *i++;
 
     cout << format("%1%\n") %
-        store->makeFixedOutputPath(recursive, hashAlgo,
-            parseHash16or32(hashAlgo, hash), name);
+        store->makeFixedOutputPath(recursive, parseHash16or32(hashAlgo, hash), name);
 }
 
 
@@ -484,6 +483,10 @@ static void opReadLog(Strings opFlags, Strings opArgs)
 
     RunPager pager;
 
+    // FIXME: move getting logs into Store.
+    auto store2 = std::dynamic_pointer_cast<LocalFSStore>(store);
+    if (!store2) throw Error(format("store ‘%s’ does not support reading logs") % store->getUri());
+
     for (auto & i : opArgs) {
         Path path = useDeriver(store->followLinksToStorePath(i));
 
@@ -494,8 +497,8 @@ static void opReadLog(Strings opFlags, Strings opArgs)
 
             Path logPath =
                 j == 0
-                ? (format("%1%/%2%/%3%/%4%") % settings.nixLogDir % drvsLogDir % string(baseName, 0, 2) % string(baseName, 2)).str()
-                : (format("%1%/%2%/%3%") % settings.nixLogDir % drvsLogDir % baseName).str();
+                ? (format("%1%/%2%/%3%/%4%") % store2->logDir % drvsLogDir % string(baseName, 0, 2) % string(baseName, 2)).str()
+                : (format("%1%/%2%/%3%") % store2->logDir % drvsLogDir % baseName).str();
             Path logBz2Path = logPath + ".bz2";
 
             if (pathExists(logPath)) {

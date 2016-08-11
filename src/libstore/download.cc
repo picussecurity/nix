@@ -3,10 +3,12 @@
 #include "globals.hh"
 #include "hash.hh"
 #include "store-api.hh"
+#include "archive.hh"
 
 #include <curl/curl.h>
 
 #include <iostream>
+#include <thread>
 
 
 namespace nix {
@@ -157,7 +159,7 @@ struct CurlDownloader : public Downloader
             curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0);
         }
 
-        data->clear();
+        data = make_ref<std::string>();
 
         if (requestHeaders) {
             curl_slist_free_all(requestHeaders);
@@ -193,9 +195,17 @@ struct CurlDownloader : public Downloader
         if (res != CURLE_OK) {
             Error err =
                 httpStatus == 404 ? NotFound :
-                httpStatus == 403 ? Forbidden : Misc;
-            throw DownloadError(err, format("unable to download ‘%1%’: %2% (%3%)")
-                % url % curl_easy_strerror(res) % res);
+                httpStatus == 403 ? Forbidden :
+                (httpStatus == 408 || httpStatus == 500 || httpStatus == 503
+                 || httpStatus == 504  || httpStatus == 522 || httpStatus == 524
+                 || res == CURLE_COULDNT_RESOLVE_HOST) ? Transient :
+                Misc;
+            if (res == CURLE_HTTP_RETURNED_ERROR && httpStatus != -1)
+                throw DownloadError(err, format("unable to download ‘%s’: HTTP error %d")
+                    % url % httpStatus);
+            else
+                throw DownloadError(err, format("unable to download ‘%s’: %s (%d)")
+                    % url % curl_easy_strerror(res) % res);
         }
 
         if (httpStatus == 304) return false;
@@ -205,14 +215,26 @@ struct CurlDownloader : public Downloader
 
     DownloadResult download(string url, const DownloadOptions & options) override
     {
-        DownloadResult res;
-        if (fetch(resolveUri(url), options)) {
-            res.cached = false;
-            res.data = data;
-        } else
-            res.cached = true;
-        res.etag = etag;
-        return res;
+        size_t attempt = 0;
+
+        while (true) {
+            try {
+                DownloadResult res;
+                if (fetch(resolveUri(url), options)) {
+                    res.cached = false;
+                    res.data = data;
+                } else
+                    res.cached = true;
+                res.etag = etag;
+                return res;
+            } catch (DownloadError & e) {
+                attempt++;
+                if (e.error != Transient || attempt >= options.tries) throw;
+                auto ms = 25 * (1 << (attempt - 1));
+                printMsg(lvlError, format("warning: %s; retrying in %d ms") % e.what() % ms);
+                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            }
+        }
     }
 };
 
@@ -221,9 +243,20 @@ ref<Downloader> makeDownloader()
     return make_ref<CurlDownloader>();
 }
 
-Path Downloader::downloadCached(ref<Store> store, const string & url_, bool unpack)
+Path Downloader::downloadCached(ref<Store> store, const string & url_, bool unpack, const Hash & expectedHash)
 {
     auto url = resolveUri(url_);
+
+    string name;
+    auto p = url.rfind('/');
+    if (p != string::npos) name = string(url, p + 1);
+
+    Path expectedStorePath;
+    if (expectedHash) {
+        expectedStorePath = store->makeFixedOutputPath(unpack, expectedHash, name);
+        if (store->isValidPath(expectedStorePath))
+            return expectedStorePath;
+    }
 
     Path cacheDir = getCacheDir() + "/nix/tarballs";
     createDirs(cacheDir);
@@ -258,10 +291,6 @@ Path Downloader::downloadCached(ref<Store> store, const string & url_, bool unpa
             storePath = "";
     }
 
-    string name;
-    auto p = url.rfind('/');
-    if (p != string::npos) name = string(url, p + 1);
-
     if (!skip) {
 
         try {
@@ -269,8 +298,16 @@ Path Downloader::downloadCached(ref<Store> store, const string & url_, bool unpa
             options.expectedETag = expectedETag;
             auto res = download(url, options);
 
-            if (!res.cached)
-                storePath = store->addTextToStore(name, *res.data, PathSet(), false);
+            if (!res.cached) {
+                ValidPathInfo info;
+                StringSink sink;
+                dumpString(*res.data, sink);
+                Hash hash = hashString(expectedHash ? expectedHash.type : htSHA256, *res.data);
+                info.path = store->makeFixedOutputPath(false, hash, name);
+                info.narHash = hashString(htSHA256, *sink.s);
+                store->addToStore(info, *sink.s, false, true);
+                storePath = info.path;
+            }
 
             assert(!storePath.empty());
             replaceSymlink(storePath, fileLink);
@@ -300,8 +337,11 @@ Path Downloader::downloadCached(ref<Store> store, const string & url_, bool unpa
             unpackedStorePath = store->addToStore(name, tmpDir, true, htSHA256, defaultPathFilter, false);
         }
         replaceSymlink(unpackedStorePath, unpackedLink);
-        return unpackedStorePath;
+        storePath = unpackedStorePath;
     }
+
+    if (expectedStorePath != "" && storePath != expectedStorePath)
+        throw nix::Error(format("hash mismatch in file downloaded from ‘%s’") % url);
 
     return storePath;
 }

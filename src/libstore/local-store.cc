@@ -38,8 +38,8 @@ namespace nix {
 
 LocalStore::LocalStore(const Params & params)
     : LocalFSStore(params)
-    , realStoreDir(get(params, "real", storeDir))
-    , dbDir(get(params, "state", "") != "" ? get(params, "state", "") + "/db" : settings.nixDBPath)
+    , realStoreDir(get(params, "real", rootDir != "" ? rootDir + "/nix/store" : storeDir))
+    , dbDir(stateDir + "/db")
     , linksDir(realStoreDir + "/.links")
     , reservedPath(dbDir + "/reserved")
     , schemaPath(dbDir + "/schema")
@@ -120,11 +120,11 @@ LocalStore::LocalStore(const Params & params)
             AutoCloseFD fd = open(reservedPath.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
             int res = -1;
 #if HAVE_POSIX_FALLOCATE
-            res = posix_fallocate(fd, 0, settings.reservedSize);
+            res = posix_fallocate(fd.get(), 0, settings.reservedSize);
 #endif
             if (res == -1) {
-                writeFull(fd, string(settings.reservedSize, 'X'));
-                ftruncate(fd, settings.reservedSize);
+                writeFull(fd.get(), string(settings.reservedSize, 'X'));
+                ftruncate(fd.get(), settings.reservedSize);
             }
         }
     } catch (SysError & e) { /* don't care about errors */
@@ -135,9 +135,9 @@ LocalStore::LocalStore(const Params & params)
     Path globalLockPath = dbDir + "/big-lock";
     globalLock = openLockFile(globalLockPath.c_str(), true);
 
-    if (!lockFile(globalLock, ltRead, false)) {
+    if (!lockFile(globalLock.get(), ltRead, false)) {
         printMsg(lvlError, "waiting for the big Nix store lock...");
-        lockFile(globalLock, ltRead, true);
+        lockFile(globalLock.get(), ltRead, true);
     }
 
     /* Check the current database schema and if necessary do an
@@ -166,9 +166,9 @@ LocalStore::LocalStore(const Params & params)
                 "which is no longer supported. To convert to the new format,\n"
                 "please upgrade Nix to version 1.11 first.");
 
-        if (!lockFile(globalLock, ltWrite, false)) {
+        if (!lockFile(globalLock.get(), ltWrite, false)) {
             printMsg(lvlError, "waiting for exclusive access to the Nix store...");
-            lockFile(globalLock, ltWrite, true);
+            lockFile(globalLock.get(), ltWrite, true);
         }
 
         /* Get the schema version again, because another process may
@@ -181,36 +181,39 @@ LocalStore::LocalStore(const Params & params)
 
         if (curSchema < 8) {
             SQLiteTxn txn(state->db);
-            if (sqlite3_exec(state->db, "alter table ValidPaths add column ultimate integer", 0, 0, 0) != SQLITE_OK)
-                throwSQLiteError(state->db, "upgrading database schema");
-            if (sqlite3_exec(state->db, "alter table ValidPaths add column sigs text", 0, 0, 0) != SQLITE_OK)
-                throwSQLiteError(state->db, "upgrading database schema");
+            state->db.exec("alter table ValidPaths add column ultimate integer");
+            state->db.exec("alter table ValidPaths add column sigs text");
             txn.commit();
         }
 
         if (curSchema < 9) {
             SQLiteTxn txn(state->db);
-            if (sqlite3_exec(state->db, "drop table FailedPaths", 0, 0, 0) != SQLITE_OK)
-                throwSQLiteError(state->db, "upgrading database schema");
+            state->db.exec("drop table FailedPaths");
+            txn.commit();
+        }
+
+        if (curSchema < 10) {
+            SQLiteTxn txn(state->db);
+            state->db.exec("alter table ValidPaths add column ca text");
             txn.commit();
         }
 
         writeFile(schemaPath, (format("%1%") % nixSchemaVersion).str());
 
-        lockFile(globalLock, ltRead, true);
+        lockFile(globalLock.get(), ltRead, true);
     }
 
     else openDB(*state, false);
 
     /* Prepare SQL statements. */
     state->stmtRegisterValidPath.create(state->db,
-        "insert into ValidPaths (path, hash, registrationTime, deriver, narSize, ultimate, sigs) values (?, ?, ?, ?, ?, ?, ?);");
+        "insert into ValidPaths (path, hash, registrationTime, deriver, narSize, ultimate, sigs, ca) values (?, ?, ?, ?, ?, ?, ?, ?);");
     state->stmtUpdatePathInfo.create(state->db,
-        "update ValidPaths set narSize = ?, hash = ?, ultimate = ?, sigs = ? where path = ?;");
+        "update ValidPaths set narSize = ?, hash = ?, ultimate = ?, sigs = ?, ca = ? where path = ?;");
     state->stmtAddReference.create(state->db,
         "insert or replace into Refs (referrer, reference) values (?, ?);");
     state->stmtQueryPathInfo.create(state->db,
-        "select id, hash, registrationTime, deriver, narSize, ultimate, sigs from ValidPaths where path = ?;");
+        "select id, hash, registrationTime, deriver, narSize, ultimate, sigs, ca from ValidPaths where path = ?;");
     state->stmtQueryReferences.create(state->db,
         "select path from Refs join ValidPaths on reference = id where referrer = ?;");
     state->stmtQueryReferrers.create(state->db,
@@ -236,8 +239,8 @@ LocalStore::~LocalStore()
     auto state(_state.lock());
 
     try {
-        if (state->fdTempRoots != -1) {
-            state->fdTempRoots.close();
+        if (state->fdTempRoots) {
+            state->fdTempRoots = -1;
             unlink(state->fnTempRoots.c_str());
         }
     } catch (...) {
@@ -279,8 +282,7 @@ void LocalStore::openDB(State & state, bool create)
     if (sqlite3_busy_timeout(db, 60 * 60 * 1000) != SQLITE_OK)
         throwSQLiteError(db, "setting timeout");
 
-    if (sqlite3_exec(db, "pragma foreign_keys = 1;", 0, 0, 0) != SQLITE_OK)
-        throwSQLiteError(db, "enabling foreign keys");
+    db.exec("pragma foreign_keys = 1");
 
     /* !!! check whether sqlite has been built with foreign key
        support */
@@ -290,8 +292,7 @@ void LocalStore::openDB(State & state, bool create)
        all.  This can cause database corruption if the system
        crashes. */
     string syncMode = settings.fsyncMetadata ? "normal" : "off";
-    if (sqlite3_exec(db, ("pragma synchronous = " + syncMode + ";").c_str(), 0, 0, 0) != SQLITE_OK)
-        throwSQLiteError(db, "setting synchronous mode");
+    db.exec("pragma synchronous = " + syncMode);
 
     /* Set the SQLite journal mode.  WAL mode is fastest, so it's the
        default. */
@@ -319,8 +320,7 @@ void LocalStore::openDB(State & state, bool create)
         const char * schema =
 #include "schema.sql.hh"
             ;
-        if (sqlite3_exec(db, (const char *) schema, 0, 0, 0) != SQLITE_OK)
-            throwSQLiteError(db, "initialising database schema");
+        db.exec(schema);
     }
 }
 
@@ -486,9 +486,9 @@ void LocalStore::checkDerivationOutputs(const Path & drvPath, const Derivation &
         if (out == drv.outputs.end())
             throw Error(format("derivation ‘%1%’ does not have an output named ‘out’") % drvPath);
 
-        bool recursive; HashType ht; Hash h;
-        out->second.parseHashInfo(recursive, ht, h);
-        Path outPath = makeFixedOutputPath(recursive, ht, h, drvName);
+        bool recursive; Hash h;
+        out->second.parseHashInfo(recursive, h);
+        Path outPath = makeFixedOutputPath(recursive, h, drvName);
 
         StringPairs::const_iterator j = drv.env.find("out");
         if (out->second.path != outPath || j == drv.env.end() || j->second != outPath)
@@ -527,6 +527,7 @@ uint64_t LocalStore::addValidPath(State & state,
         (info.narSize, info.narSize != 0)
         (info.ultimate ? 1 : 0, info.ultimate)
         (concatStringsSep(" ", info.sigs), !info.sigs.empty())
+        (info.ca, !info.ca.empty())
         .exec();
     uint64_t id = sqlite3_last_insert_rowid(state.db);
 
@@ -609,6 +610,9 @@ std::shared_ptr<ValidPathInfo> LocalStore::queryPathInfoUncached(const Path & pa
         s = (const char *) sqlite3_column_text(state->stmtQueryPathInfo, 6);
         if (s) info->sigs = tokenizeString<StringSet>(s, " ");
 
+        s = (const char *) sqlite3_column_text(state->stmtQueryPathInfo, 7);
+        if (s) info->ca = s;
+
         /* Get the references. */
         auto useQueryReferences(state->stmtQueryReferences.use()(info->id));
 
@@ -628,6 +632,7 @@ void LocalStore::updatePathInfo(State & state, const ValidPathInfo & info)
         ("sha256:" + printHash(info.narHash))
         (info.ultimate ? 1 : 0, info.ultimate)
         (concatStringsSep(" ", info.sigs), !info.sigs.empty())
+        (info.ca, !info.ca.empty())
         (info.path)
         .exec();
 }
@@ -898,7 +903,7 @@ void LocalStore::addToStore(const ValidPathInfo & info, const std::string & nar,
         throw Error(format("hash mismatch importing path ‘%s’; expected hash ‘%s’, got ‘%s’") %
             info.path % info.narHash.to_string() % h.to_string());
 
-    if (requireSigs && !dontCheckSigs && !info.checkSignatures(publicKeys))
+    if (requireSigs && !dontCheckSigs && !info.checkSignatures(*this, publicKeys))
         throw Error(format("cannot import path ‘%s’ because it lacks a valid signature") % info.path);
 
     addTempRoot(info.path);
@@ -940,7 +945,7 @@ Path LocalStore::addToStoreFromDump(const string & dump, const string & name,
 {
     Hash h = hashString(hashAlgo, dump);
 
-    Path dstPath = makeFixedOutputPath(recursive, hashAlgo, h, name);
+    Path dstPath = makeFixedOutputPath(recursive, h, name);
 
     addTempRoot(dstPath);
 
@@ -983,6 +988,7 @@ Path LocalStore::addToStoreFromDump(const string & dump, const string & name,
             info.narHash = hash.first;
             info.narSize = hash.second;
             info.ultimate = true;
+            info.ca = "fixed:" + (recursive ? (std::string) "r:" : "") + h.to_string();
             registerValidPath(info);
         }
 
@@ -1014,7 +1020,8 @@ Path LocalStore::addToStore(const string & name, const Path & _srcPath,
 Path LocalStore::addTextToStore(const string & name, const string & s,
     const PathSet & references, bool repair)
 {
-    Path dstPath = computeStorePathForText(name, s, references);
+    auto hash = hashString(htSHA256, s);
+    auto dstPath = makeTextPath(name, hash, references);
 
     addTempRoot(dstPath);
 
@@ -1034,16 +1041,17 @@ Path LocalStore::addTextToStore(const string & name, const string & s,
 
             StringSink sink;
             dumpString(s, sink);
-            auto hash = hashString(htSHA256, *sink.s);
+            auto narHash = hashString(htSHA256, *sink.s);
 
             optimisePath(realPath);
 
             ValidPathInfo info;
             info.path = dstPath;
-            info.narHash = hash;
+            info.narHash = narHash;
             info.narSize = sink.s->size();
             info.references = references;
             info.ultimate = true;
+            info.ca = "text:" + hash.to_string();
             registerValidPath(info);
         }
 
@@ -1115,7 +1123,7 @@ bool LocalStore::verifyStore(bool checkContents, bool repair)
 
     /* Release the GC lock so that checking content hashes (which can
        take ages) doesn't block the GC or builds. */
-    fdGCLock.close();
+    fdGCLock = -1;
 
     /* Optionally, check the content hashes (slow). */
     if (checkContents) {
@@ -1282,9 +1290,7 @@ void LocalStore::upgradeStore7()
 void LocalStore::vacuumDB()
 {
     auto state(_state.lock());
-
-    if (sqlite3_exec(state->db, "vacuum;", 0, 0, 0) != SQLITE_OK)
-        throwSQLiteError(state->db, "vacuuming SQLite database");
+    state->db.exec("vacuum");
 }
 
 

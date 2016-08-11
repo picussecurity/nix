@@ -413,12 +413,10 @@ static void performOp(ref<LocalStore> store, bool trusted, unsigned int clientVe
         options.pathsToDelete = readStorePaths<PathSet>(*store, from);
         options.ignoreLiveness = readInt(from);
         options.maxFreed = readLongLong(from);
-        readInt(from); // obsolete field
-        if (GET_PROTOCOL_MINOR(clientVersion) >= 5) {
-            /* removed options */
-            readInt(from);
-            readInt(from);
-        }
+        // obsolete fields
+        readInt(from);
+        readInt(from);
+        readInt(from);
 
         GCResults results;
 
@@ -440,17 +438,12 @@ static void performOp(ref<LocalStore> store, bool trusted, unsigned int clientVe
         verbosity = (Verbosity) readInt(from);
         settings.set("build-max-jobs", std::to_string(readInt(from)));
         settings.set("build-max-silent-time", std::to_string(readInt(from)));
-        if (GET_PROTOCOL_MINOR(clientVersion) >= 2)
-            settings.useBuildHook = readInt(from) != 0;
-        if (GET_PROTOCOL_MINOR(clientVersion) >= 4) {
-            settings.verboseBuild = lvlError == (Verbosity) readInt(from);
-            readInt(from); // obsolete logType
-            readInt(from); // obsolete printBuildTrace
-        }
-        if (GET_PROTOCOL_MINOR(clientVersion) >= 6)
-            settings.set("build-cores", std::to_string(readInt(from)));
-        if (GET_PROTOCOL_MINOR(clientVersion) >= 10)
-            settings.set("build-use-substitutes", readInt(from) ? "true" : "false");
+        settings.useBuildHook = readInt(from) != 0;
+        settings.verboseBuild = lvlError == (Verbosity) readInt(from);
+        readInt(from); // obsolete logType
+        readInt(from); // obsolete printBuildTrace
+        settings.set("build-cores", std::to_string(readInt(from)));
+        settings.set("build-use-substitutes", readInt(from) ? "true" : "false");
         if (GET_PROTOCOL_MINOR(clientVersion) >= 12) {
             unsigned int n = readInt(from);
             for (unsigned int i = 0; i < n; i++) {
@@ -478,9 +471,7 @@ static void performOp(ref<LocalStore> store, bool trusted, unsigned int clientVe
         if (i == infos.end())
             to << 0;
         else {
-            to << 1 << i->second.deriver << i->second.references << i->second.downloadSize;
-            if (GET_PROTOCOL_MINOR(clientVersion) >= 7)
-                to << i->second.narSize;
+            to << 1 << i->second.deriver << i->second.references << i->second.downloadSize << i->second.narSize;
         }
         break;
     }
@@ -524,7 +515,8 @@ static void performOp(ref<LocalStore> store, bool trusted, unsigned int clientVe
                << info->registrationTime << info->narSize;
             if (GET_PROTOCOL_MINOR(clientVersion) >= 16) {
                 to << info->ultimate
-                   << info->sigs;
+                   << info->sigs
+                   << info->ca;
             }
         } else {
             assert(GET_PROTOCOL_MINOR(clientVersion) >= 17);
@@ -585,11 +577,13 @@ static void processConnection(bool trusted)
     to.flush();
     unsigned int clientVersion = readInt(from);
 
+    if (clientVersion < 0x10a)
+        throw Error("the Nix client version is too old");
+
     if (GET_PROTOCOL_MINOR(clientVersion) >= 14 && readInt(from))
         setAffinityTo(readInt(from));
 
-    if (GET_PROTOCOL_MINOR(clientVersion) >= 11)
-        readInt(from); // obsolete reserveSpace
+    readInt(from); // obsolete reserveSpace
 
     /* Send startup error messages to the client. */
     startWork();
@@ -636,10 +630,10 @@ static void processConnection(bool trusted)
                    during addTextToStore() / importPath().  If that
                    happens, just send the error message and exit. */
                 bool errorAllowed = canSendStderr;
-                stopWork(false, e.msg(), GET_PROTOCOL_MINOR(clientVersion) >= 8 ? e.status : 0);
+                stopWork(false, e.msg(), e.status);
                 if (!errorAllowed) throw;
             } catch (std::bad_alloc & e) {
-                stopWork(false, "Nix daemon out of memory", GET_PROTOCOL_MINOR(clientVersion) >= 8 ? 1 : 0);
+                stopWork(false, "Nix daemon out of memory", 1);
                 throw;
             }
 
@@ -653,7 +647,7 @@ static void processConnection(bool trusted)
         printMsg(lvlDebug, format("%1% operations") % opCount);
 
     } catch (Error & e) {
-        stopWork(false, e.msg(), GET_PROTOCOL_MINOR(clientVersion) >= 8 ? 1 : 0);
+        stopWork(false, e.msg(), 1);
         to.flush();
         return;
     }
@@ -767,7 +761,7 @@ static void daemonLoop(char * * argv)
 
         /* Create and bind to a Unix domain socket. */
         fdSocket = socket(PF_UNIX, SOCK_STREAM, 0);
-        if (fdSocket == -1)
+        if (!fdSocket)
             throw SysError("cannot create Unix domain socket");
 
         string socketPath = settings.nixDaemonSocketFile;
@@ -793,7 +787,7 @@ static void daemonLoop(char * * argv)
            (everybody can connect --- provided they have access to the
            directory containing the socket). */
         mode_t oldMode = umask(0111);
-        int res = bind(fdSocket, (struct sockaddr *) &addr, sizeof(addr));
+        int res = bind(fdSocket.get(), (struct sockaddr *) &addr, sizeof(addr));
         umask(oldMode);
         if (res == -1)
             throw SysError(format("cannot bind to socket ‘%1%’") % socketPath);
@@ -801,11 +795,11 @@ static void daemonLoop(char * * argv)
         if (chdir("/") == -1) /* back to the root */
             throw SysError("cannot change current directory");
 
-        if (listen(fdSocket, 5) == -1)
+        if (listen(fdSocket.get(), 5) == -1)
             throw SysError(format("cannot listen on socket ‘%1%’") % socketPath);
     }
 
-    closeOnExec(fdSocket);
+    closeOnExec(fdSocket.get());
 
     /* Loop accepting connections. */
     while (1) {
@@ -815,18 +809,18 @@ static void daemonLoop(char * * argv)
             struct sockaddr_un remoteAddr;
             socklen_t remoteAddrLen = sizeof(remoteAddr);
 
-            AutoCloseFD remote = accept(fdSocket,
+            AutoCloseFD remote = accept(fdSocket.get(),
                 (struct sockaddr *) &remoteAddr, &remoteAddrLen);
             checkInterrupt();
-            if (remote == -1) {
+            if (!remote) {
                 if (errno == EINTR) continue;
                 throw SysError("accepting connection");
             }
 
-            closeOnExec(remote);
+            closeOnExec(remote.get());
 
             bool trusted = false;
-            PeerInfo peer = getPeerInfo(remote);
+            PeerInfo peer = getPeerInfo(remote.get());
 
             struct passwd * pw = peer.uidKnown ? getpwuid(peer.uid) : 0;
             string user = pw ? pw->pw_name : std::to_string(peer.uid);
@@ -854,7 +848,7 @@ static void daemonLoop(char * * argv)
             options.runExitHandlers = true;
             options.allowVfork = false;
             startProcess([&]() {
-                fdSocket.close();
+                fdSocket = -1;
 
                 /* Background the daemon. */
                 if (setsid() == -1)
@@ -870,8 +864,8 @@ static void daemonLoop(char * * argv)
                 }
 
                 /* Handle the connection. */
-                from.fd = remote;
-                to.fd = remote;
+                from.fd = remote.get();
+                to.fd = remote.get();
                 processConnection(trusted);
 
                 exit(0);

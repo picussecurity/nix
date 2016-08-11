@@ -191,32 +191,21 @@ Path Store::makeOutputPath(const string & id,
 
 
 Path Store::makeFixedOutputPath(bool recursive,
-    HashType hashAlgo, Hash hash, string name) const
+    const Hash & hash, const string & name) const
 {
-    return hashAlgo == htSHA256 && recursive
+    return hash.type == htSHA256 && recursive
         ? makeStorePath("source", hash, name)
         : makeStorePath("output:out", hashString(htSHA256,
                 "fixed:out:" + (recursive ? (string) "r:" : "") +
-                printHashType(hashAlgo) + ":" + printHash(hash) + ":"),
+                printHashType(hash.type) + ":" + printHash(hash) + ":"),
             name);
 }
 
 
-std::pair<Path, Hash> Store::computeStorePathForPath(const Path & srcPath,
-    bool recursive, HashType hashAlgo, PathFilter & filter) const
-{
-    HashType ht(hashAlgo);
-    Hash h = recursive ? hashPath(ht, srcPath, filter).first : hashFile(ht, srcPath);
-    string name = baseNameOf(srcPath);
-    Path dstPath = makeFixedOutputPath(recursive, hashAlgo, h, name);
-    return std::pair<Path, Hash>(dstPath, h);
-}
-
-
-Path Store::computeStorePathForText(const string & name, const string & s,
+Path Store::makeTextPath(const string & name, const Hash & hash,
     const PathSet & references) const
 {
-    Hash hash = hashString(htSHA256, s);
+    assert(hash.type == htSHA256);
     /* Stuff the references (if any) into the type.  This is a bit
        hacky, but we can't put them in `s' since that would be
        ambiguous. */
@@ -226,6 +215,23 @@ Path Store::computeStorePathForText(const string & name, const string & s,
         type += i;
     }
     return makeStorePath(type, hash, name);
+}
+
+
+std::pair<Path, Hash> Store::computeStorePathForPath(const Path & srcPath,
+    bool recursive, HashType hashAlgo, PathFilter & filter) const
+{
+    Hash h = recursive ? hashPath(hashAlgo, srcPath, filter).first : hashFile(hashAlgo, srcPath);
+    string name = baseNameOf(srcPath);
+    Path dstPath = makeFixedOutputPath(recursive, h, name);
+    return std::pair<Path, Hash>(dstPath, h);
+}
+
+
+Path Store::computeStorePathForText(const string & name, const string & s,
+    const PathSet & references) const
+{
+    return makeTextPath(name, hashString(htSHA256, s), references);
 }
 
 
@@ -433,9 +439,38 @@ void ValidPathInfo::sign(const SecretKey & secretKey)
 }
 
 
-unsigned int ValidPathInfo::checkSignatures(const PublicKeys & publicKeys) const
+bool ValidPathInfo::isContentAddressed(const Store & store) const
 {
-    unsigned int good = 0;
+    auto warn = [&]() {
+        printMsg(lvlError, format("warning: path ‘%s’ claims to be content-addressed but isn't") % path);
+    };
+
+    if (hasPrefix(ca, "text:")) {
+        auto hash = parseHash(std::string(ca, 5));
+        if (store.makeTextPath(storePathToName(path), hash, references) == path)
+            return true;
+        else
+            warn();
+    }
+
+    else if (hasPrefix(ca, "fixed:")) {
+        bool recursive = ca.compare(6, 2, "r:") == 0;
+        auto hash = parseHash(std::string(ca, recursive ? 8 : 6));
+        if (store.makeFixedOutputPath(recursive, hash, storePathToName(path)) == path)
+            return true;
+        else
+            warn();
+    }
+
+    return false;
+}
+
+
+size_t ValidPathInfo::checkSignatures(const Store & store, const PublicKeys & publicKeys) const
+{
+    if (isContentAddressed(store)) return maxSigs;
+
+    size_t good = 0;
     for (auto & sig : sigs)
         if (checkSignature(publicKeys, sig))
             good++;
