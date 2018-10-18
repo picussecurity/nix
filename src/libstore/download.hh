@@ -13,7 +13,7 @@ struct DownloadRequest
 {
     std::string uri;
     std::string expectedETag;
-    bool verifyTLS = true;
+    bool verifyTLS = false;
     bool head = false;
     size_t tries = 5;
     unsigned int baseRetryTimeMs = 250;
