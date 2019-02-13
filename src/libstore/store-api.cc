@@ -320,6 +320,8 @@ ref<const ValidPathInfo> Store::queryPathInfo(const Path & storePath)
 void Store::queryPathInfo(const Path & storePath,
     Callback<ref<ValidPathInfo>> callback)
 {
+    assertStorePath(storePath);
+
     auto hashPart = storePathToHash(storePath);
 
     try {
@@ -586,15 +588,19 @@ void copyStorePath(ref<Store> srcStore, ref<Store> dstStore,
 
     uint64_t total = 0;
 
-    // FIXME
-#if 0
     if (!info->narHash) {
+        StringSink sink;
+        srcStore->narFromPath({storePath}, sink);
         auto info2 = make_ref<ValidPathInfo>(*info);
         info2->narHash = hashString(htSHA256, *sink.s);
         if (!info->narSize) info2->narSize = sink.s->size();
+        if (info->ultimate) info2->ultimate = false;
         info = info2;
+
+        StringSource source(*sink.s);
+        dstStore->addToStore(*info, source, repair, checkSigs);
+        return;
     }
-#endif
 
     if (info->ultimate) {
         auto info2 = make_ref<ValidPathInfo>(*info);
@@ -610,7 +616,7 @@ void copyStorePath(ref<Store> srcStore, ref<Store> dstStore,
         });
         srcStore->narFromPath({storePath}, wrapperSink);
     }, [&]() {
-	throw EndOfFile("NAR for '%s' fetched from '%s' is incomplete", storePath, srcStore->getUri());
+        throw EndOfFile("NAR for '%s' fetched from '%s' is incomplete", storePath, srcStore->getUri());
     });
 
     dstStore->addToStore(*info, *source, repair, checkSigs);

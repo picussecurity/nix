@@ -9,6 +9,7 @@
 #include "monitor-fd.hh"
 #include "derivations.hh"
 #include "finally.hh"
+#include "legacy.hh"
 
 #include <algorithm>
 
@@ -557,7 +558,8 @@ static void performOp(TunnelLogger * logger, ref<Store> store,
                     ;
                 else if (trusted
                     || name == settings.buildTimeout.name
-                    || name == "connect-timeout")
+                    || name == "connect-timeout"
+                    || (name == "builders" && value == ""))
                     settings.set(name, value);
                 else if (setSubstituters(settings.substituters))
                     ;
@@ -708,7 +710,7 @@ static void performOp(TunnelLogger * logger, ref<Store> store,
         logger->startWork();
 
         // FIXME: race if addToStore doesn't read source?
-        store.cast<Store>()->addToStore(info, *source, (RepairFlag) repair,
+        store->addToStore(info, *source, (RepairFlag) repair,
             dontCheckSigs ? NoCheckSigs : CheckSigs, nullptr);
 
         logger->stopWork();
@@ -1057,11 +1059,9 @@ static void daemonLoop(char * * argv)
 }
 
 
-int main(int argc, char * * argv)
+static int _main(int argc, char * * argv)
 {
-    return handleExceptions(argv[0], [&]() {
-        initNix();
-
+    {
         auto stdio = false;
 
         parseCmdLine(argc, argv, [&](Strings::iterator & arg, const Strings::iterator & end) {
@@ -1121,7 +1121,7 @@ int main(int argc, char * * argv)
                         if (res == -1)
                             throw SysError("splicing data from stdin to daemon socket");
                         else if (res == 0)
-                            return;
+                            return 0;
                     }
                 }
             } else {
@@ -1130,5 +1130,9 @@ int main(int argc, char * * argv)
         } else {
             daemonLoop(argv);
         }
-    });
+
+        return 0;
+    }
 }
+
+static RegisterLegacyCommand s1("nix-daemon", _main);

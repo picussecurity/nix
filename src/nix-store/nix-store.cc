@@ -8,7 +8,8 @@
 #include "shared.hh"
 #include "util.hh"
 #include "worker-protocol.hh"
-#include "xmlgraph.hh"
+#include "graphml.hh"
+#include "legacy.hh"
 
 #include <iostream>
 #include <algorithm>
@@ -273,7 +274,7 @@ static void opQuery(Strings opFlags, Strings opArgs)
     enum QueryType
         { qDefault, qOutputs, qRequisites, qReferences, qReferrers
         , qReferrersClosure, qDeriver, qBinding, qHash, qSize
-        , qTree, qGraph, qXml, qResolve, qRoots };
+        , qTree, qGraph, qGraphML, qResolve, qRoots };
     QueryType query = qDefault;
     bool useOutput = false;
     bool includeOutputs = false;
@@ -299,7 +300,7 @@ static void opQuery(Strings opFlags, Strings opArgs)
         else if (i == "--size") query = qSize;
         else if (i == "--tree") query = qTree;
         else if (i == "--graph") query = qGraph;
-        else if (i == "--xml") query = qXml;
+        else if (i == "--graphml") query = qGraphML;
         else if (i == "--resolve") query = qResolve;
         else if (i == "--roots") query = qRoots;
         else if (i == "--use-output" || i == "-u") useOutput = true;
@@ -403,13 +404,13 @@ static void opQuery(Strings opFlags, Strings opArgs)
             break;
         }
 
-        case qXml: {
+        case qGraphML: {
             PathSet roots;
             for (auto & i : opArgs) {
                 PathSet paths = maybeUseOutputs(store->followLinksToStorePath(i), useOutput, forceRealise);
                 roots.insert(paths.begin(), paths.end());
             }
-            printXmlGraph(ref<Store>(store), roots);
+            printGraphML(ref<Store>(store), roots);
             break;
         }
 
@@ -993,11 +994,9 @@ static void opVersion(Strings opFlags, Strings opArgs)
 /* Scan the arguments; find the operation, set global flags, put all
    other flags in a list, and put all other arguments in another
    list. */
-int main(int argc, char * * argv)
+static int _main(int argc, char * * argv)
 {
-    return handleExceptions(argv[0], [&]() {
-        initNix();
-
+    {
         Strings opFlags, opArgs;
         Operation op = 0;
 
@@ -1084,5 +1083,9 @@ int main(int argc, char * * argv)
             store = openStore();
 
         op(opFlags, opArgs);
-    });
+
+        return 0;
+    }
 }
+
+static RegisterLegacyCommand s1("nix-store", _main);
