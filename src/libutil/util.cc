@@ -202,7 +202,7 @@ bool isInDir(const Path & path, const Path & dir)
 
 bool isDirOrInDir(const Path & path, const Path & dir)
 {
-    return path == dir or isInDir(path, dir);
+    return path == dir || isInDir(path, dir);
 }
 
 
@@ -494,6 +494,15 @@ Path getConfigDir()
     if (configDir.empty())
         configDir = getHome() + "/.config";
     return configDir;
+}
+
+std::vector<Path> getConfigDirs()
+{
+    Path configHome = getConfigDir();
+    string configDirs = getEnv("XDG_CONFIG_DIRS");
+    std::vector<Path> result = tokenizeString<std::vector<string>>(configDirs, ":");
+    result.insert(result.begin(), configHome);
+    return result;
 }
 
 
@@ -927,6 +936,8 @@ pid_t startProcess(std::function<void()> fun, const ProcessOptions & options)
                 throw SysError("setting death signal");
 #endif
             restoreAffinity();
+            if (options.restoreMountNamespace)
+                restoreMountNamespace();
             fun();
         } catch (std::exception & e) {
             try {
@@ -1493,6 +1504,28 @@ std::unique_ptr<InterruptCallback> createInterruptCallback(std::function<void()>
     res->it--;
 
     return std::unique_ptr<InterruptCallback>(res.release());
+}
+
+static AutoCloseFD fdSavedMountNamespace;
+
+void saveMountNamespace()
+{
+#if __linux__
+    std::once_flag done;
+    std::call_once(done, []() {
+        fdSavedMountNamespace = open("/proc/self/ns/mnt", O_RDONLY);
+        if (!fdSavedMountNamespace)
+            throw SysError("saving parent mount namespace");
+    });
+#endif
+}
+
+void restoreMountNamespace()
+{
+#if __linux__
+    if (fdSavedMountNamespace && setns(fdSavedMountNamespace.get(), CLONE_NEWNS) == -1)
+        throw SysError("restoring parent mount namespace");
+#endif
 }
 
 }

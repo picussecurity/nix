@@ -7,6 +7,8 @@
 #include "common-eval-args.hh"
 #include "attr-path.hh"
 #include "legacy.hh"
+#include "finally.hh"
+#include "progress-bar.hh"
 
 #include <iostream>
 
@@ -95,6 +97,11 @@ static int _main(int argc, char * * argv)
 
         if (args.size() > 2)
             throw UsageError("too many arguments");
+
+        Finally f([]() { stopProgressBar(); });
+
+        if (isatty(STDERR_FILENO))
+          startProgressBar();
 
         auto store = openStore();
         auto state = std::make_unique<EvalState>(myArgs.searchPath, store);
@@ -212,6 +219,8 @@ static int _main(int argc, char * * argv)
 
             assert(storePath == store->makeFixedOutputPath(unpack, hash, name));
         }
+
+        stopProgressBar();
 
         if (!printPath)
             printInfo(format("path is '%1%'") % storePath);

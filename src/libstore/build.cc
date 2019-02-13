@@ -2193,6 +2193,7 @@ void DerivationGoal::startBuilder()
         userNamespaceSync.create();
 
         options.allowVfork = false;
+        options.restoreMountNamespace = false;
 
         Pid helper = startProcess([&]() {
 
@@ -2259,6 +2260,7 @@ void DerivationGoal::startBuilder()
 #endif
     {
         options.allowVfork = !buildUser && !drv->isBuiltin();
+        options.restoreMountNamespace = false;
         pid = startProcess([&]() {
             runChild();
         }, options);
@@ -3127,8 +3129,8 @@ void DerivationGoal::registerOutputs()
                 /* Throw an error after registering the path as
                    valid. */
                 delayedException = std::make_exception_ptr(
-                    BuildError("fixed-output derivation produced path '%s' with %s hash '%s' instead of the expected hash '%s'",
-                        dest, printHashType(h.type), printHash16or32(h2), printHash16or32(h)));
+                    BuildError("hash mismatch in fixed-output derivation '%s':\n  wanted: %s\n  got:    %s",
+                        dest, h.to_string(), h2.to_string()));
 
                 Path actualDest = worker.store.toRealPath(dest);
 
